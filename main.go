@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/yosisa/fluxion/buffer"
 	"github.com/yosisa/fluxion/message"
@@ -12,11 +13,13 @@ import (
 
 type Buffer struct {
 	sync.Mutex
-	Items []string
+	Items        []string
+	LastAccessed time.Time
 }
 
 type Config struct {
 	Listen string
+	TTL    buffer.Duration
 }
 
 type NetbufOutput struct {
@@ -40,6 +43,10 @@ func (p *NetbufOutput) Start() (err error) {
 		return
 	}
 	go p.accepter()
+	if p.conf.TTL > 0 {
+		p.env.Log.Infof("Enable gc: ttl %v", time.Duration(p.conf.TTL))
+		go p.gc()
+	}
 	return
 }
 
@@ -89,6 +96,7 @@ func (p *NetbufOutput) handler(conn net.Conn) {
 	buf.Lock()
 	defer buf.Unlock()
 
+	buf.LastAccessed = time.Now()
 	p.env.Log.Infof("Send %d line to %s", len(buf.Items), remote)
 	for i, s := range buf.Items {
 		if _, err := conn.Write([]byte(s + "\n")); err != nil {
@@ -106,7 +114,24 @@ func (p *NetbufOutput) addBuffer(name string) {
 	if _, ok := p.bufs[name]; ok {
 		return
 	}
-	p.bufs[name] = &Buffer{}
+	p.bufs[name] = &Buffer{
+		LastAccessed: time.Now(),
+	}
+}
+
+func (p *NetbufOutput) gc() {
+	ttl := time.Duration(p.conf.TTL)
+	for _ = range time.Tick(time.Minute) {
+		p.lock.Lock()
+		now := time.Now()
+		for remote, buf := range p.bufs {
+			if now.After(buf.LastAccessed.Add(ttl)) {
+				p.env.Log.Infof("Buffer for %s is expired, last access %v", remote, buf.LastAccessed)
+				delete(p.bufs, remote)
+			}
+		}
+		p.lock.Unlock()
+	}
 }
 
 func main() {
