@@ -10,6 +10,11 @@ import (
 	"github.com/yosisa/fluxion/plugin"
 )
 
+type Buffer struct {
+	sync.Mutex
+	Items []string
+}
+
 type Config struct {
 	Listen string
 }
@@ -18,17 +23,15 @@ type NetbufOutput struct {
 	env    *plugin.Env
 	conf   *Config
 	ln     net.Listener
-	bufs   map[string][]string
+	bufs   map[string]*Buffer
 	lock   sync.Mutex
-	locks  map[string]sync.Mutex
 	closed bool
 }
 
 func (p *NetbufOutput) Init(env *plugin.Env) (err error) {
 	p.env = env
 	p.conf = &Config{}
-	p.bufs = make(map[string][]string)
-	p.locks = make(map[string]sync.Mutex)
+	p.bufs = make(map[string]*Buffer)
 	return env.ReadConfig(p.conf)
 }
 
@@ -47,12 +50,12 @@ func (p *NetbufOutput) Encode(ev *message.Event) (buffer.Sizer, error) {
 }
 
 func (p *NetbufOutput) Write(l []buffer.Sizer) (int, error) {
-	for name, lock := range p.locks {
-		lock.Lock()
+	for _, buf := range p.bufs {
+		buf.Lock()
 		for _, s := range l {
-			p.bufs[name] = append(p.bufs[name], string(s.(buffer.StringItem)))
+			buf.Items = append(buf.Items, string(s.(buffer.StringItem)))
 		}
-		lock.Unlock()
+		buf.Unlock()
 	}
 	return len(l), nil
 }
@@ -76,26 +79,25 @@ func (p *NetbufOutput) handler(conn net.Conn) {
 	defer conn.Close()
 	remote, _, _ := net.SplitHostPort(conn.RemoteAddr().String())
 	p.env.Log.Infof("Connected from %s", remote)
-	lock, ok := p.locks[remote]
+	buf, ok := p.bufs[remote]
 	if !ok {
 		p.env.Log.Infof("No buffer found for %s, create now", remote)
 		p.addBuffer(remote)
 		return
 	}
 
-	lock.Lock()
-	defer lock.Unlock()
+	buf.Lock()
+	defer buf.Unlock()
 
-	buf := p.bufs[remote]
-	p.env.Log.Infof("Send %d line to %s", len(buf), remote)
-	for i, s := range buf {
+	p.env.Log.Infof("Send %d line to %s", len(buf.Items), remote)
+	for i, s := range buf.Items {
 		if _, err := conn.Write([]byte(s + "\n")); err != nil {
 			p.env.Log.Warning(err)
-			p.bufs[remote] = buf[i:]
+			buf.Items = buf.Items[i:]
 			return
 		}
 	}
-	p.bufs[remote] = buf[:0]
+	buf.Items = buf.Items[:0]
 }
 
 func (p *NetbufOutput) addBuffer(name string) {
@@ -104,8 +106,7 @@ func (p *NetbufOutput) addBuffer(name string) {
 	if _, ok := p.bufs[name]; ok {
 		return
 	}
-	p.bufs[name] = nil
-	p.locks[name] = sync.Mutex{}
+	p.bufs[name] = &Buffer{}
 }
 
 func main() {
